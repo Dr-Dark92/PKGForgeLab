@@ -117,8 +117,8 @@ public static class PkgInspector
         var entryTableSize = BE32(header, 0x1C);
         var bodyOffset = BE64(header, 0x20);
         var bodySize = BE64(header, 0x28);
-        var contentOffset = BE64(header, 0x30);
-        var contentSize = BE64(header, 0x38);
+        var contentOffset = BE64(header, 0x410);
+        var contentSize = BE64(header, 0x418);
         var packageSize = BE64(header, 0x430);
 
         if (entryCount > 4096)
