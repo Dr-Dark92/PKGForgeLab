@@ -18,7 +18,7 @@ try
     foreach (var report in reports)
     {
         var outPath = Path.ChangeExtension(report.Path, ".pkglab.json");
-        File.WriteAllText(outPath, JsonSerializer.Serialize(report, JsonOptions));
+        File.WriteAllText(outPath, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
         Console.WriteLine($"Wrote: {outPath}");
     }
 
@@ -42,7 +42,6 @@ catch (Exception ex)
     return 1;
 }
 
-static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
 public sealed record PkgReport(
     string Path,
