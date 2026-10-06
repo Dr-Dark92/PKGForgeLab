@@ -59,6 +59,7 @@ public sealed record PkgReport(
     ulong MetadataSpan,
     ulong ContentBlocks64K,
     IReadOnlyList<PkgEntryReport> Entries,
+    IReadOnlyList<SfoEntryReport> ParamSfo,
     PlayGoReport? PlayGo,
     OuterPfsReport? OuterPfs);
 
@@ -70,6 +71,13 @@ public sealed record PkgEntryReport(
     uint DataOffset,
     uint DataSize,
     string? Name);
+
+public sealed record SfoEntryReport(
+    string Key,
+    ushort Format,
+    uint Length,
+    uint MaxLength,
+    string Value);
 
 public sealed record PlayGoReport(
     uint DataOffset,
@@ -151,6 +159,12 @@ public static class PkgInspector
             x.Id, x.NameOffset, x.Flags1, x.Flags2, x.DataOffset, x.DataSize,
             ReadName(names, x.NameOffset))).ToArray();
 
+        var paramSfo = Array.Empty<SfoEntryReport>();
+        var sfoEntry = entries.FirstOrDefault(x => x.Id == 0x00001000);
+        if (sfoEntry is not null && sfoEntry.DataSize >= 0x14 &&
+            (ulong)sfoEntry.DataOffset + sfoEntry.DataSize <= (ulong)fs.Length)
+            paramSfo = ParseSfo(ReadExact(fs, sfoEntry.DataOffset, checked((int)sfoEntry.DataSize)));
+
         PlayGoReport? playGo = null;
         var pg = entries.FirstOrDefault(x => x.Id == PlayGoChunkDat);
         var sha = entries.FirstOrDefault(x => x.Id == PlayGoChunkSha);
@@ -215,8 +229,48 @@ public static class PkgInspector
             contentOffset >= bodyOffset ? contentOffset - bodyOffset : 0,
             contentSize / 0x10000,
             entries,
+            paramSfo,
             playGo,
             outer);
+    }
+
+    private static SfoEntryReport[] ParseSfo(byte[] b)
+    {
+        if (b.Length < 0x14 || LE32(b, 0) != 0x46535000)
+            return [];
+        var keyTable = checked((int)LE32(b, 0x08));
+        var dataTable = checked((int)LE32(b, 0x0C));
+        var count = checked((int)LE32(b, 0x10));
+        if (count < 0 || count > 1024) return [];
+        var result = new List<SfoEntryReport>(count);
+        for (var i = 0; i < count; i++)
+        {
+            var o = 0x14 + i * 0x10;
+            if (o + 0x10 > b.Length) break;
+            var keyOff = LE16(b, o);
+            var format = LE16(b, o + 2);
+            var len = LE32(b, o + 4);
+            var max = LE32(b, o + 8);
+            var dataOff = LE32(b, o + 12);
+            var ks = keyTable + keyOff;
+            if (ks < 0 || ks >= b.Length) continue;
+            var ke = Array.IndexOf(b, (byte)0, ks);
+            if (ke < 0) continue;
+            var key = System.Text.Encoding.UTF8.GetString(b, ks, ke - ks);
+            var ds = (long)dataTable + dataOff;
+            if (ds < 0 || ds + len > b.Length) continue;
+            string value;
+            if (format == 0x0404 && len == 4)
+                value = $"0x{LE32(b, checked((int)ds)):X8}";
+            else
+            {
+                var n = checked((int)len);
+                if (n > 0 && b[checked((int)ds) + n - 1] == 0) n--;
+                value = System.Text.Encoding.UTF8.GetString(b, checked((int)ds), n);
+            }
+            result.Add(new SfoEntryReport(key, format, len, max, value));
+        }
+        return result.OrderBy(x => x.Key, StringComparer.Ordinal).ToArray();
     }
 
     private static string? ReadName(byte[] names, uint offset)
@@ -295,6 +349,17 @@ public static class PkgComparer
         }
 
         sb.AppendLine();
+        sb.AppendLine("[param.sfo]");
+        var sfoKeys = good.ParamSfo.Select(x => x.Key).Union(bad.ParamSfo.Select(x => x.Key)).Order(StringComparer.Ordinal);
+        foreach (var key in sfoKeys)
+        {
+            var g = good.ParamSfo.FirstOrDefault(x => x.Key == key);
+            var b = bad.ParamSfo.FirstOrDefault(x => x.Key == key);
+            if (g is null || b is null || g.Format != b.Format || g.Length != b.Length || g.MaxLength != b.MaxLength || g.Value != b.Value)
+                sb.AppendLine($"{key}: good={FormatSfo(g)} | bad={FormatSfo(b)}");
+        }
+
+        sb.AppendLine();
         sb.AppendLine("[Entry IDs]");
         var goodIds = good.Entries.Select(x=>x.Id).ToHashSet();
         var badIds = bad.Entries.Select(x=>x.Id).ToHashSet();
@@ -308,6 +373,9 @@ public static class PkgComparer
 
         return sb.ToString();
     }
+
+    private static string FormatSfo(SfoEntryReport? e) =>
+        e is null ? "missing" : $"fmt=0x{e.Format:X4}, len={e.Length}, max={e.MaxLength}, value={e.Value}";
 
     private static string FormatEntry(PkgEntryReport? e) =>
         e is null ? "missing" : $"off=0x{e.DataOffset:X}, size=0x{e.DataSize:X}, f1=0x{e.Flags1:X8}, f2=0x{e.Flags2:X8}, name={e.Name ?? "-"}";
