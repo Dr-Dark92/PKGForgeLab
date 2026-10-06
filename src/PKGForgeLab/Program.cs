@@ -50,7 +50,7 @@ public sealed record PkgReport(
     uint Magic,
     uint EntryCount,
     uint EntryTableOffset,
-    uint EntryTableSize,
+    uint MainEntryDataSize,
     ulong BodyOffset,
     ulong BodySize,
     ulong ContentOffset,
@@ -92,11 +92,11 @@ public sealed record OuterPfsReport(
     byte ModeByte,
     ushort Flags,
     uint BlockSize,
-    long BlockCount,
+    long NBlock,
     long InodeCount,
     long DataBlockCount,
     long InodeBlockCount,
-    ulong DeclaredImageBytes);
+    ulong DataImageBytes);
 
 public static class PkgInspector
 {
@@ -114,7 +114,7 @@ public static class PkgInspector
         var magic = BE32(header, 0x00);
         var entryCount = BE32(header, 0x10);
         var entryTableOffset = BE32(header, 0x18);
-        var entryTableSize = BE32(header, 0x1C);
+        var mainEntryDataSize = BE32(header, 0x1C);
         var bodyOffset = BE64(header, 0x20);
         var bodySize = BE64(header, 0x28);
         var contentOffset = BE64(header, 0x410);
@@ -176,10 +176,11 @@ public static class PkgInspector
         {
             var b = ReadExact(fs, checked((long)contentOffset), 0x380);
             var blockSize = LE32(b, 0x20);
-            var blockCount = LE64S(b, 0x28);
-            ulong declared = 0;
-            if (blockSize > 0 && blockCount > 0)
-                declared = checked((ulong)blockSize * (ulong)blockCount);
+            var nBlock = LE64S(b, 0x28);
+            var dataBlockCount = LE64S(b, 0x38);
+            ulong dataImageBytes = 0;
+            if (blockSize > 0 && dataBlockCount > 0)
+                dataImageBytes = checked((ulong)blockSize * (ulong)dataBlockCount);
             outer = new OuterPfsReport(
                 contentOffset,
                 (ulong)fs.Length - contentOffset,
@@ -188,11 +189,11 @@ public static class PkgInspector
                 b[0x1A],
                 LE16(b, 0x1C),
                 blockSize,
-                blockCount,
+                nBlock,
                 LE64S(b, 0x30),
-                LE64S(b, 0x38),
+                dataBlockCount,
                 LE64S(b, 0x40),
-                declared);
+                dataImageBytes);
         }
 
         fs.Position = 0;
@@ -205,7 +206,7 @@ public static class PkgInspector
             magic,
             entryCount,
             entryTableOffset,
-            entryTableSize,
+            mainEntryDataSize,
             bodyOffset,
             bodySize,
             contentOffset,
@@ -256,7 +257,7 @@ public static class PkgComparer
         AddHex(sb, "Magic", good.Magic, bad.Magic);
         Add(sb, "Entry count", good.EntryCount, bad.EntryCount);
         AddHex(sb, "Entry table offset", good.EntryTableOffset, bad.EntryTableOffset);
-        AddHex(sb, "Entry table size", good.EntryTableSize, bad.EntryTableSize);
+        AddHex(sb, "Main entry data size", good.MainEntryDataSize, bad.MainEntryDataSize);
         AddHex(sb, "Body offset", good.BodyOffset, bad.BodyOffset);
         AddHex(sb, "Body size", good.BodySize, bad.BodySize);
         AddHex(sb, "PFS/content offset", good.ContentOffset, bad.ContentOffset);
@@ -285,10 +286,11 @@ public static class PkgComparer
         else
         {
             Add(sb,"block size",good.OuterPfs.BlockSize,bad.OuterPfs.BlockSize);
-            Add(sb,"block count",good.OuterPfs.BlockCount,bad.OuterPfs.BlockCount);
+            Add(sb,"nblock",good.OuterPfs.NBlock,bad.OuterPfs.NBlock);
             Add(sb,"inode count",good.OuterPfs.InodeCount,bad.OuterPfs.InodeCount);
+            Add(sb,"data block count",good.OuterPfs.DataBlockCount,bad.OuterPfs.DataBlockCount);
             Add(sb,"inode blocks",good.OuterPfs.InodeBlockCount,bad.OuterPfs.InodeBlockCount);
-            Add(sb,"declared image bytes",good.OuterPfs.DeclaredImageBytes,bad.OuterPfs.DeclaredImageBytes);
+            Add(sb,"data image bytes",good.OuterPfs.DataImageBytes,bad.OuterPfs.DataImageBytes);
             Add(sb,"available image bytes",good.OuterPfs.AvailableBytes,bad.OuterPfs.AvailableBytes);
         }
 
