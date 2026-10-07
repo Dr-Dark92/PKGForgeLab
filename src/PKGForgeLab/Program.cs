@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -281,6 +282,7 @@ public static class PkgInspector
         const int blockSize = 0x10000;
 
         var keyFingerprint = DiagnoseEntryKeys(pkg, entries, contentId, passcode);
+        var recoveryTag = TryRecoverFakePkgEkpfs(pkg, entries) is null ? "ekpfs=fallback" : "ekpfs=recovered";
         const int sectorSize = 0x1000;
 
         if (outer.BlockSize != blockSize)
@@ -288,7 +290,8 @@ public static class PkgInspector
 
         var image = ReadExact(pkg, checked((long)outer.FileOffset), checked((int)outer.AvailableBytes));
         var seed = image.AsSpan(0x370, 16).ToArray();
-        var ekpfs = ComputeKey(contentId, passcode, 1);
+        var recoveredEkpfs = TryRecoverFakePkgEkpfs(pkg, entries);
+        var ekpfs = recoveredEkpfs ?? ComputeKey(contentId, passcode, 1);
         var k = PfsCryptoKey(ekpfs, seed, 1);
         var tweakKey = k[..16];
         var dataKey = k[16..32];
@@ -334,7 +337,7 @@ public static class PkgInspector
                 }
             }
             if (!ValidOuterExtent(flags, storedSize, logicalSize, firstBlock, image.Length, blockSize))
-                return new InnerPfsReport("OUTER_DECRYPT_FAILED: no valid pfs_image inode; " + keyFingerprint + " | " + string.Join(" | ", candidates), logicalSize, [], []);
+                return new InnerPfsReport("OUTER_DECRYPT_FAILED: no valid pfs_image inode; " + recoveryTag + " | " + keyFingerprint + " | " + string.Join(" | ", candidates), logicalSize, [], []);
         }
         if ((flags & 1) == 0)
             return new InnerPfsReport("OUTER_DECRYPT_FAILED: pfs_image.dat is not marked compressed/PFSC", logicalSize, [], []);
@@ -361,6 +364,70 @@ public static class PkgInspector
     }
 
     private sealed record InnerNode(string Path, long Size, int StartBlock);
+
+    // fPKG EKPFS recovery mirrors LibOrbisPkg Pkg.GetEkpfs(): decrypt DK3 from
+    // ENTRY_KEYS, use DK3 to decrypt IMAGE_KEY, then unwrap IMAGE_KEY with the
+    // public fake-package private factors. Only public homebrew/fPKG key material.
+    private static byte[]? TryRecoverFakePkgEkpfs(FileStream pkg, IReadOnlyList<PkgEntryReport> entries)
+    {
+        try
+        {
+            var ke=entries.FirstOrDefault(x=>x.Id==0x10);
+            var ie=entries.FirstOrDefault(x=>x.Id==0x20);
+            if(ke is null||ie is null) return null;
+            var entryKeys=ReadExact(pkg,ke.DataOffset,checked((int)ke.DataSize));
+            // KeysEntry layout: 0x20 content-id hash + 7*0x20 xhash + seven 0x100 RSA blobs.
+            const int rsaBase=0x100;
+            var dk3Cipher=entryKeys.AsSpan(rsaBase+3*0x100,0x100).ToArray();
+            var dk3=RsaPkcs1PrivateDecrypt(dk3Cipher,Derived3P,Derived3Q);
+            if(dk3.Length!=32) return null;
+
+            var imageCipher=ReadExact(pkg,ie.DataOffset,checked((int)ie.DataSize));
+            var meta=new byte[32];
+            BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(0,4),ie.Id);
+            BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(4,4),ie.NameOffset);
+            BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(8,4),ie.Flags1);
+            BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(12,4),ie.Flags2);
+            BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(16,4),checked((uint)ie.DataOffset));
+            BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(20,4),checked((uint)ie.DataSize));
+            var ivKey=SHA256.HashData(meta.Concat(dk3).ToArray());
+            using(var aes=Aes.Create())
+            {
+                aes.Key=ivKey[16..32]; aes.IV=ivKey[..16]; aes.Mode=CipherMode.CBC; aes.Padding=PaddingMode.None;
+                using var dec=aes.CreateDecryptor();
+                imageCipher=dec.TransformFinalBlock(imageCipher,0,imageCipher.Length);
+            }
+            var ekpfs=RsaPkcs1PrivateDecrypt(imageCipher,FakeP,FakeQ);
+            return ekpfs.Length==32 ? ekpfs : null;
+        }
+        catch { return null; }
+    }
+
+    private static byte[] RsaPkcs1PrivateDecrypt(byte[] ciphertext, string pHex, string qHex)
+    {
+        var p=BigInteger.Parse("0"+pHex,System.Globalization.NumberStyles.HexNumber);
+        var q=BigInteger.Parse("0"+qHex,System.Globalization.NumberStyles.HexNumber);
+        var n=p*q; var phi=(p-1)*(q-1); var e=new BigInteger(65537); var d=ModInverse(e,phi);
+        var m=BigInteger.ModPow(new BigInteger(ciphertext,isUnsigned:true,isBigEndian:true),d,n);
+        var em=m.ToByteArray(isUnsigned:true,isBigEndian:true);
+        if(em.Length<256) em=new byte[256-em.Length].Concat(em).ToArray();
+        if(em.Length!=256||em[0]!=0||em[1]!=2) throw new CryptographicException("Invalid PKCS#1 block.");
+        var z=Array.IndexOf(em,(byte)0,2);
+        if(z<10) throw new CryptographicException("Invalid PKCS#1 padding.");
+        return em[(z+1)..];
+    }
+
+    private static BigInteger ModInverse(BigInteger a, BigInteger m)
+    {
+        BigInteger m0=m,x0=0,x1=1;
+        while(a>1){var q=a/m;(a,m)=(m,a%m);(x0,x1)=(x1-q*x0,x0);}
+        if(x1<0)x1+=m0; return x1;
+    }
+
+    private const string Derived3P="F967AD9912310C56A22E161C46B34D5B43BE42A2F686968042C3C73FC342F58749339F075D6E2C04FDE3E1B2AE0A0CF0C7A61CA16350C8099C5124526C5E5EBD1E2706BBBC9E94E135D46DB3CB3C68DD68B3FE6CCB8D8220762363B7E96810014EDCBA275D01C12D805E2BAF826BD884B6105286A7898EAE9AE289C6F7D587FB";
+    private const string Derived3Q="D7A10F9A8BF2C91195329A8CF0D94047F568A00DBDC1FC432F65F9C3610F257754ADD758AC8440608D3FF3658975B5C62C511A2F1F22E4431154BEC9B4C7B51B050BBC569ACD4AD973685E5CFB92B78B0DFFF507CAB4C89B963C079E3E6B2A11F28AB18AD72E1BA5532406ED50B89067B1E241C69201EE10F061BBFBB27D4A73";
+    private const string FakeP="FEF6BF1D69AB16250847556B86E43588722AB13DF8B644CAB3AB19D10424280A7455B8154509CC131CF2BA37A903908F0210FF257986CC18509A105F5B4C1C4EB0A7E359B12DA0C6B0202C213312B3AF723483CD522FAF0F205A1BC0E2A376340FD7FCC141C9F979401742213E9DFDC7C150DE445AC931896A7805BE65B4E82D";
+    private const string FakeQ="C79E4758007D6282B0D22281D4A8971B790C3AB0D7C930E3C3538E57EFF09B9FB39052C6942236AAE64A5F721D70E87658C8B291CE9CC3E9097F2E4797CC9039153531DE1F0C8C0DC1C292BE97BF2F91A18C7D50A8212FD7A29A7EB5A72A9002D9F33DD1EBB8E05A799E7D8DCA186DBD9EA180286B2AFE51249B6F4D84778023";
 
     private static string DiagnoseEntryKeys(FileStream pkg, IReadOnlyList<PkgEntryReport> entries, string contentId, string passcode)
     {
