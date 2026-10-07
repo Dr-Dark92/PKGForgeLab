@@ -61,7 +61,8 @@ public sealed record PkgReport(
     IReadOnlyList<PkgEntryReport> Entries,
     IReadOnlyList<SfoEntryReport> ParamSfo,
     PlayGoReport? PlayGo,
-    OuterPfsReport? OuterPfs);
+    OuterPfsReport? OuterPfs,
+    InnerPfsReport? InnerPfs);
 
 public sealed record PkgEntryReport(
     uint Id,
@@ -105,6 +106,33 @@ public sealed record OuterPfsReport(
     long DataBlockCount,
     long InodeBlockCount,
     ulong DataImageBytes);
+
+public sealed record InnerPfsReport(
+    string Status,
+    long? LogicalSize,
+    IReadOnlyList<InnerFileReport> Files,
+    IReadOnlyList<TocFileReport> TocFiles);
+
+public sealed record InnerFileReport(
+    string Path,
+    long Size,
+    string Sha256);
+
+public sealed record TocFileReport(
+    string Path,
+    long Size,
+    string Sha256,
+    string Hex,
+    IReadOnlyList<TocRecordReport> Records);
+
+public sealed record TocRecordReport(
+    int Index,
+    string Kind,
+    string Hex,
+    string AdrControl,
+    string Point,
+    string PMinSecFrame,
+    string AMinSecFrame);
 
 public static class PkgInspector
 {
@@ -210,6 +238,18 @@ public static class PkgInspector
                 dataImageBytes);
         }
 
+        InnerPfsReport? inner = null;
+        try
+        {
+            var contentId = paramSfo.FirstOrDefault(x => x.Key == "CONTENT_ID")?.Value;
+            if (outer is not null && !string.IsNullOrWhiteSpace(contentId))
+                inner = InspectInnerPfs(fs, outer, contentId);
+        }
+        catch (Exception ex)
+        {
+            inner = new InnerPfsReport("ERROR: " + ex.Message, null, [], []);
+        }
+
         fs.Position = 0;
         var sha256 = Convert.ToHexString(SHA256.HashData(fs));
 
@@ -231,7 +271,249 @@ public static class PkgInspector
             entries,
             paramSfo,
             playGo,
-            outer);
+            outer,
+            inner);
+    }
+
+    private static InnerPfsReport InspectInnerPfs(FileStream pkg, OuterPfsReport outer, string contentId)
+    {
+        const string passcode = "00000000000000000000000000000000";
+        const int blockSize = 0x10000;
+        const int sectorSize = 0x1000;
+
+        if (outer.BlockSize != blockSize)
+            return new InnerPfsReport($"UNSUPPORTED outer block size 0x{outer.BlockSize:X}", null, [], []);
+
+        var image = ReadExact(pkg, checked((long)outer.FileOffset), checked((int)outer.AvailableBytes));
+        var seed = image.AsSpan(0x370, 16).ToArray();
+        var ekpfs = ComputeKey(contentId, passcode, 1);
+        var k = PfsCryptoKey(ekpfs, seed, 1);
+        var tweakKey = k[..16];
+        var dataKey = k[16..32];
+
+        // Outer PFS: block 0 header is plaintext; block 4 is the deliberate plaintext exception.
+        for (var sectorNo = blockSize / sectorSize; sectorNo * sectorSize < image.Length; sectorNo++)
+        {
+            var blockNo = sectorNo / (blockSize / sectorSize);
+            if (blockNo == 4) continue;
+            AesXtsDecryptSectorInPlace(image.AsSpan(sectorNo * sectorSize, sectorSize), dataKey, tweakKey, (ulong)sectorNo);
+        }
+
+        if (LE64S(image, 0x08) != 20130315)
+            return new InnerPfsReport("OUTER_DECRYPT_FAILED: header magic mismatch", null, [], []);
+
+        const int signedInodeSize = 0x2C8;
+        var fileInode = blockSize + 3 * signedInodeSize;
+        if (fileInode + signedInodeSize > image.Length)
+            return new InnerPfsReport("OUTER_DECRYPT_FAILED: pfs_image inode is out of range", null, [], []);
+
+        var flags = LE32(image, fileInode + 4);
+        var storedSize = LE64S(image, fileInode + 8);
+        var logicalSize = LE64S(image, fileInode + 16);
+        var firstBlock = BinaryPrimitives.ReadInt32LittleEndian(image.AsSpan(fileInode + 132, 4));
+        if ((flags & 1) == 0)
+            return new InnerPfsReport("OUTER_DECRYPT_FAILED: pfs_image.dat is not marked compressed/PFSC", logicalSize, [], []);
+        if (storedSize <= 0 || firstBlock <= 0 || (long)firstBlock * blockSize + storedSize > image.Length)
+            return new InnerPfsReport("OUTER_DECRYPT_FAILED: invalid pfs_image.dat extent", logicalSize, [], []);
+
+        var pfsc = image.AsSpan(firstBlock * blockSize, checked((int)storedSize)).ToArray();
+        var inner = UnwrapPfsc(pfsc, logicalSize);
+        var files = ParseInnerPfsFiles(inner);
+        var toc = files.Where(x => x.Path.EndsWith(".toc", StringComparison.OrdinalIgnoreCase))
+            .Select(x =>
+            {
+                var data = ReadInnerFile(inner, x);
+                return new TocFileReport(
+                    x.Path,
+                    x.Size,
+                    Convert.ToHexString(SHA256.HashData(data)),
+                    Convert.ToHexString(data),
+                    DecodeToc(data));
+            }).ToArray();
+
+        return new InnerPfsReport("OK", logicalSize, files.Select(x => new InnerFileReport(
+            x.Path, x.Size, Convert.ToHexString(SHA256.HashData(ReadInnerFile(inner, x))))).ToArray(), toc);
+    }
+
+    private sealed record InnerNode(string Path, long Size, int StartBlock);
+
+    private static byte[] UnwrapPfsc(byte[] pfsc, long logicalSize)
+    {
+        if (pfsc.Length < 0x10000 || BinaryPrimitives.ReadUInt32BigEndian(pfsc.AsSpan(0,4)) != 0x50465343)
+            throw new InvalidDataException("pfs_image.dat is not PFSC.");
+        var blockSize = BinaryPrimitives.ReadInt32LittleEndian(pfsc.AsSpan(12,4));
+        var tableOffset = BinaryPrimitives.ReadInt64LittleEndian(pfsc.AsSpan(24,8));
+        var dataOffset = BinaryPrimitives.ReadInt64LittleEndian(pfsc.AsSpan(32,8));
+        var logical = BinaryPrimitives.ReadInt64LittleEndian(pfsc.AsSpan(40,8));
+        if (blockSize != 0x10000 || tableOffset < 0 || dataOffset <= tableOffset || dataOffset > pfsc.Length)
+            throw new InvalidDataException("Unsupported PFSC geometry.");
+        var blockCount = (logical + blockSize - 1) / blockSize;
+        var result = new byte[checked((int)Math.Min(logicalSize > 0 ? logicalSize : logical, int.MaxValue))];
+
+        for (var i = 0L; i < blockCount; i++)
+        {
+            var p0o = checked((int)(tableOffset + i * 8));
+            var p1o = checked((int)(tableOffset + (i + 1) * 8));
+            if (p1o + 8 > pfsc.Length) throw new InvalidDataException("PFSC seek table truncated.");
+            var p0 = BinaryPrimitives.ReadInt64LittleEndian(pfsc.AsSpan(p0o,8));
+            var p1 = BinaryPrimitives.ReadInt64LittleEndian(pfsc.AsSpan(p1o,8));
+            if (p0 < dataOffset || p1 < p0 || p1 > pfsc.Length) throw new InvalidDataException("PFSC seek entry invalid.");
+            var stored = pfsc.AsSpan(checked((int)p0), checked((int)(p1-p0))).ToArray();
+            byte[] block;
+            if (stored.Length == blockSize) block = stored;
+            else
+            {
+                using var ms = new MemoryStream(stored);
+                using var z = new System.IO.Compression.ZLibStream(ms, System.IO.Compression.CompressionMode.Decompress);
+                block = new byte[blockSize];
+                var read = 0;
+                while (read < block.Length)
+                {
+                    var n = z.Read(block, read, block.Length - read);
+                    if (n == 0) break;
+                    read += n;
+                }
+            }
+            var dst = checked((int)(i * blockSize));
+            if (dst >= result.Length) break;
+            Buffer.BlockCopy(block, 0, result, dst, Math.Min(block.Length, result.Length - dst));
+        }
+        return result;
+    }
+
+    private static InnerNode[] ParseInnerPfsFiles(byte[] pfs)
+    {
+        const int blockSize = 0x10000;
+        const int inodeSize = 0xA8;
+        if (pfs.Length < blockSize || LE64S(pfs, 8) != 20130315)
+            throw new InvalidDataException("Inner PFS header magic mismatch.");
+        var inodeCount = checked((int)LE64S(pfs, 0x30));
+        if (inodeCount < 3 || inodeCount > 65536) throw new InvalidDataException("Inner PFS inode count is implausible.");
+
+        var result = new List<InnerNode>();
+        WalkInnerDir(pfs, 2, "", inodeCount, result, new HashSet<uint>());
+        return result.OrderBy(x => x.Path, StringComparer.Ordinal).ToArray();
+
+        static void WalkInnerDir(byte[] pfs, uint inode, string prefix, int inodeCount, List<InnerNode> result, HashSet<uint> visited)
+        {
+            if (!visited.Add(inode)) return;
+            var d = ReadInnerInode(pfs, inode, inodeCount);
+            var start = d.StartBlock * blockSize;
+            var end = Math.Min((long)pfs.Length, start + d.Size);
+            var pos = start;
+            while (pos + 16 <= end)
+            {
+                var ino = BinaryPrimitives.ReadUInt32LittleEndian(pfs.AsSpan(checked((int)pos),4));
+                var type = BinaryPrimitives.ReadInt32LittleEndian(pfs.AsSpan(checked((int)pos+4),4));
+                var nameLen = BinaryPrimitives.ReadInt32LittleEndian(pfs.AsSpan(checked((int)pos+8),4));
+                var entSize = BinaryPrimitives.ReadInt32LittleEndian(pfs.AsSpan(checked((int)pos+12),4));
+                if (entSize <= 0 || pos + entSize > end || nameLen < 0 || nameLen > entSize - 16) break;
+                var name = System.Text.Encoding.UTF8.GetString(pfs, checked((int)pos + 16), nameLen);
+                pos += entSize;
+                if (name is "." or ".." || ino >= inodeCount) continue;
+                var child = ReadInnerInode(pfs, ino, inodeCount);
+                var path = string.IsNullOrEmpty(prefix) ? "/" + name : prefix + "/" + name;
+                if ((child.Mode & 0x4000) != 0) WalkInnerDir(pfs, ino, path, inodeCount, result, visited);
+                else if ((child.Mode & 0x8000) != 0) result.Add(new InnerNode(path, child.Size, child.StartBlock));
+            }
+        }
+    }
+
+    private readonly record struct InnerInode(ushort Mode, long Size, int StartBlock);
+    private static InnerInode ReadInnerInode(byte[] pfs, uint inode, int inodeCount)
+    {
+        const int blockSize = 0x10000;
+        const int inodeSize = 0xA8;
+        if (inode >= inodeCount) throw new InvalidDataException("Inner inode out of range.");
+        var off = blockSize + checked((int)inode) * inodeSize;
+        if (off + inodeSize > pfs.Length) throw new InvalidDataException("Inner inode table truncated.");
+        return new InnerInode(
+            BinaryPrimitives.ReadUInt16LittleEndian(pfs.AsSpan(off,2)),
+            BinaryPrimitives.ReadInt64LittleEndian(pfs.AsSpan(off+8,8)),
+            BinaryPrimitives.ReadInt32LittleEndian(pfs.AsSpan(off+100,4)));
+    }
+
+    private static byte[] ReadInnerFile(byte[] pfs, InnerNode n)
+    {
+        const int blockSize = 0x10000;
+        var off = checked((long)n.StartBlock * blockSize);
+        if (off < 0 || n.Size < 0 || off + n.Size > pfs.Length) throw new InvalidDataException($"Inner file extent invalid: {n.Path}");
+        return pfs.AsSpan(checked((int)off), checked((int)n.Size)).ToArray();
+    }
+
+    private static TocRecordReport[] DecodeToc(byte[] data)
+    {
+        var records = new List<TocRecordReport>();
+        for (var o = 0; o + 10 <= data.Length; o += 10)
+        {
+            var s = data.AsSpan(o,10);
+            var point = s[2];
+            var kind = point switch { 0xA0 => "A0", 0xA1 => "A1", 0xA2 => "A2", _ => $"TRACK {BcdToInt(point):00}" };
+            records.Add(new TocRecordReport(
+                o / 10,
+                kind,
+                Convert.ToHexString(s),
+                $"0x{s[0]:X2}",
+                $"0x{point:X2}",
+                $"{BcdToInt(s[3]):00}:{BcdToInt(s[4]):00}:{BcdToInt(s[5]):00}",
+                $"{BcdToInt(s[7]):00}:{BcdToInt(s[8]):00}:{BcdToInt(s[9]):00}"));
+        }
+        return records.ToArray();
+    }
+
+    private static int BcdToInt(byte b) => ((b >> 4) & 0xF) * 10 + (b & 0xF);
+
+    private static byte[] ComputeKey(string contentId, string passcode, uint index)
+    {
+        Span<byte> idx = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(idx, index);
+        var data = new byte[96];
+        SHA256.HashData(idx).CopyTo(data,0);
+        var padded = new byte[48];
+        System.Text.Encoding.ASCII.GetBytes(contentId).CopyTo(padded,0);
+        SHA256.HashData(padded).CopyTo(data,32);
+        System.Text.Encoding.ASCII.GetBytes(passcode).CopyTo(data,64);
+        return SHA256.HashData(data);
+    }
+
+    private static byte[] PfsCryptoKey(byte[] ekpfs, byte[] seed, uint index)
+    {
+        var d = new byte[4 + seed.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(d, index);
+        seed.CopyTo(d,4);
+        using var h = new HMACSHA256(ekpfs);
+        return h.ComputeHash(d);
+    }
+
+    private static void AesXtsDecryptSectorInPlace(Span<byte> sector, byte[] dataKey, byte[] tweakKey, ulong sectorNumber)
+    {
+        using var dataAes = Aes.Create();
+        dataAes.Key = dataKey; dataAes.Mode = CipherMode.ECB; dataAes.Padding = PaddingMode.None;
+        using var tweakAes = Aes.Create();
+        tweakAes.Key = tweakKey; tweakAes.Mode = CipherMode.ECB; tweakAes.Padding = PaddingMode.None;
+        using var dataDec = dataAes.CreateDecryptor();
+        using var tweakEnc = tweakAes.CreateEncryptor();
+
+        var tweakInput = new byte[16];
+        BinaryPrimitives.WriteUInt64LittleEndian(tweakInput, sectorNumber);
+        var tweak = new byte[16];
+        tweakEnc.TransformBlock(tweakInput,0,16,tweak,0);
+        var block = new byte[16];
+        var plain = new byte[16];
+        for (var off = 0; off < sector.Length; off += 16)
+        {
+            for (var i=0;i<16;i++) block[i]=(byte)(sector[off+i]^tweak[i]);
+            dataDec.TransformBlock(block,0,16,plain,0);
+            for (var i=0;i<16;i++) sector[off+i]=(byte)(plain[i]^tweak[i]);
+            byte feedback = 0;
+            for (var i=0;i<16;i++)
+            {
+                var value=tweak[i];
+                tweak[i]=(byte)((value<<1)|feedback);
+                feedback=(byte)(value>>7);
+            }
+            if (feedback!=0) tweak[0]^=0x87;
+        }
     }
 
     private static SfoEntryReport[] ParseSfo(byte[] b)
@@ -349,6 +631,34 @@ public static class PkgComparer
         }
 
         sb.AppendLine();
+        sb.AppendLine("[Inner PFS]");
+        sb.AppendLine($"status: good={good.InnerPfs?.Status ?? "missing"} | bad={bad.InnerPfs?.Status ?? "missing"}");
+        if (good.InnerPfs is not null && bad.InnerPfs is not null)
+        {
+            Add(sb, "logical size", good.InnerPfs.LogicalSize, bad.InnerPfs.LogicalSize);
+            var paths = good.InnerPfs.Files.Select(x=>x.Path).Union(bad.InnerPfs.Files.Select(x=>x.Path)).Order(StringComparer.Ordinal);
+            foreach (var path in paths)
+            {
+                var g = good.InnerPfs.Files.FirstOrDefault(x=>x.Path==path);
+                var b = bad.InnerPfs.Files.FirstOrDefault(x=>x.Path==path);
+                if (g is null || b is null || g.Size != b.Size || g.Sha256 != b.Sha256)
+                    sb.AppendLine($"{path}: good={FormatInner(g)} | bad={FormatInner(b)}");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("[TOC]");
+            var tocPaths = good.InnerPfs.TocFiles.Select(x=>x.Path).Union(bad.InnerPfs.TocFiles.Select(x=>x.Path)).Order(StringComparer.Ordinal);
+            foreach (var path in tocPaths)
+            {
+                var g = good.InnerPfs.TocFiles.FirstOrDefault(x=>x.Path==path);
+                var b = bad.InnerPfs.TocFiles.FirstOrDefault(x=>x.Path==path);
+                sb.AppendLine($"{path}: good={FormatToc(g)} | bad={FormatToc(b)}");
+                if (g is not null) foreach (var r in g.Records) sb.AppendLine($"  GOOD [{r.Index:00}] {r.Kind,-8} {r.Hex} ADR/CTRL={r.AdrControl} P={r.PMinSecFrame} A={r.AMinSecFrame}");
+                if (b is not null) foreach (var r in b.Records) sb.AppendLine($"  BAD  [{r.Index:00}] {r.Kind,-8} {r.Hex} ADR/CTRL={r.AdrControl} P={r.PMinSecFrame} A={r.AMinSecFrame}");
+            }
+        }
+
+        sb.AppendLine();
         sb.AppendLine("[param.sfo]");
         var sfoKeys = good.ParamSfo.Select(x => x.Key).Union(bad.ParamSfo.Select(x => x.Key)).Order(StringComparer.Ordinal);
         foreach (var key in sfoKeys)
@@ -379,6 +689,12 @@ public static class PkgComparer
 
     private static string FormatEntry(PkgEntryReport? e) =>
         e is null ? "missing" : $"off=0x{e.DataOffset:X}, size=0x{e.DataSize:X}, f1=0x{e.Flags1:X8}, f2=0x{e.Flags2:X8}, name={e.Name ?? "-"}";
+
+    private static string FormatInner(InnerFileReport? e) =>
+        e is null ? "missing" : $"size={e.Size}, sha256={e.Sha256}";
+
+    private static string FormatToc(TocFileReport? e) =>
+        e is null ? "missing" : $"size={e.Size}, sha256={e.Sha256}, hex={e.Hex}";
 
     private static void Add(System.Text.StringBuilder sb,string name,object a,object b)=>
         sb.AppendLine($"{name,-24} GOOD={a,-16} BAD={b,-16} {(Equals(a,b)?"MATCH":"DIFF")}");
