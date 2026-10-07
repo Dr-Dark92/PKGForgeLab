@@ -785,13 +785,26 @@ public static class PkgComparer
         if (good.InnerPfs is not null && bad.InnerPfs is not null)
         {
             sb.AppendLine($"{"logical size",-24} GOOD={good.InnerPfs.LogicalSize?.ToString() ?? "null",-16} BAD={bad.InnerPfs.LogicalSize?.ToString() ?? "null",-16} {(good.InnerPfs.LogicalSize==bad.InnerPfs.LogicalSize?"MATCH":"DIFF")}");
-            var paths = good.InnerPfs.Files.Select(x=>x.Path).Union(bad.InnerPfs.Files.Select(x=>x.Path)).Order(StringComparer.Ordinal);
-            foreach (var path in paths)
+            var paths = good.InnerPfs.Files.Select(x=>x.Path).Union(bad.InnerPfs.Files.Select(x=>x.Path)).Order(StringComparer.Ordinal).ToArray();
+            var deltas = paths.Select(path =>
             {
                 var g = good.InnerPfs.Files.FirstOrDefault(x=>x.Path==path);
                 var b = bad.InnerPfs.Files.FirstOrDefault(x=>x.Path==path);
-                if (g is null || b is null || g.Size != b.Size || g.Sha256 != b.Sha256)
-                    sb.AppendLine($"{path}: good={FormatInner(g)} | bad={FormatInner(b)}");
+                var state = g is null ? "BAD_ONLY" : b is null ? "GOOD_ONLY" :
+                    g.Size == b.Size && g.Sha256 == b.Sha256 ? "MATCH" : "DIFF";
+                return (path,g,b,state);
+            }).ToArray();
+
+            sb.AppendLine($"files: good={good.InnerPfs.Files.Count}, bad={bad.InnerPfs.Files.Count}, match={deltas.Count(x=>x.state=="MATCH")}, diff={deltas.Count(x=>x.state=="DIFF")}, good_only={deltas.Count(x=>x.state=="GOOD_ONLY")}, bad_only={deltas.Count(x=>x.state=="BAD_ONLY")}");
+            foreach (var group in new[]{"/data/","/sce_module/","/sce_sys/","/"})
+            {
+                sb.AppendLine();
+                sb.AppendLine($"[Inner manifest {group}]");
+                var rows = group=="/"
+                    ? deltas.Where(x=>!x.path[1..].Contains('/'))
+                    : deltas.Where(x=>x.path.StartsWith(group,StringComparison.Ordinal));
+                foreach(var x in rows)
+                    sb.AppendLine($"{x.state,-9} {x.path}: good={FormatInner(x.g)} | bad={FormatInner(x.b)}");
             }
 
             sb.AppendLine();
