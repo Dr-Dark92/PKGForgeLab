@@ -291,13 +291,7 @@ public static class PkgInspector
         var tweakKey = k[..16];
         var dataKey = k[16..32];
 
-        // Outer PFS: block 0 header is plaintext; block 4 is the deliberate plaintext exception.
-        for (var sectorNo = blockSize / sectorSize; sectorNo * sectorSize < image.Length; sectorNo++)
-        {
-            var blockNo = sectorNo / (blockSize / sectorSize);
-            if (blockNo == 4) continue;
-            AesXtsDecryptSectorInPlace(image.AsSpan(sectorNo * sectorSize, sectorSize), dataKey, tweakKey, (ulong)sectorNo);
-        }
+        DecryptOuter(image, dataKey, tweakKey, blockSize, sectorSize, sectorBase: 0);
 
         if (LE64S(image, 0x08) != 20130315)
             return new InnerPfsReport("OUTER_DECRYPT_FAILED: header magic mismatch", null, [], []);
@@ -311,6 +305,35 @@ public static class PkgInspector
         var storedSize = LE64S(image, fileInode + 8);
         var logicalSize = LE64S(image, fileInode + 16);
         var firstBlock = BinaryPrimitives.ReadInt32LittleEndian(image.AsSpan(fileInode + 132, 4));
+
+        // Reference packages produced by other toolchains can use a different XTS
+        // sector-number base. If the Ps1Forge convention yields an impossible inode,
+        // probe common bases and accept only a structurally valid pfs_image.dat inode.
+        if (!ValidOuterExtent(flags, storedSize, logicalSize, firstBlock, image.Length, blockSize))
+        {
+            var encrypted = ReadExact(pkg, checked((long)outer.FileOffset), checked((int)outer.AvailableBytes));
+            var candidates = new List<string>();
+            foreach (var baseSector in new ulong[] { 0, (ulong)outer.FileOffset / (ulong)sectorSize })
+            foreach (var keyIndex in new uint[] { 1, 2, 0 })
+            {
+                var trial = (byte[])encrypted.Clone();
+                var trialEkpfs = ComputeKey(contentId, passcode, keyIndex == 0 ? 1u : keyIndex);
+                var trialK = PfsCryptoKey(trialEkpfs, seed, 1);
+                DecryptOuter(trial, trialK[16..32], trialK[..16], blockSize, sectorSize, baseSector);
+                var tf = LE32(trial, fileInode + 4);
+                var ts = LE64S(trial, fileInode + 8);
+                var tl = LE64S(trial, fileInode + 16);
+                var tb = BinaryPrimitives.ReadInt32LittleEndian(trial.AsSpan(fileInode + 132, 4));
+                candidates.Add($"base={baseSector},key={keyIndex}:flags=0x{tf:X},stored={ts},logical={tl},first={tb}");
+                if (ValidOuterExtent(tf, ts, tl, tb, trial.Length, blockSize))
+                {
+                    image = trial; flags = tf; storedSize = ts; logicalSize = tl; firstBlock = tb;
+                    break;
+                }
+            }
+            if (!ValidOuterExtent(flags, storedSize, logicalSize, firstBlock, image.Length, blockSize))
+                return new InnerPfsReport("OUTER_DECRYPT_FAILED: no valid pfs_image inode; " + string.Join(" | ", candidates), logicalSize, [], []);
+        }
         if ((flags & 1) == 0)
             return new InnerPfsReport("OUTER_DECRYPT_FAILED: pfs_image.dat is not marked compressed/PFSC", logicalSize, [], []);
         if (storedSize <= 0 || firstBlock <= 0 || (long)firstBlock * blockSize + storedSize > image.Length)
@@ -336,6 +359,20 @@ public static class PkgInspector
     }
 
     private sealed record InnerNode(string Path, long Size, int StartBlock);
+
+    private static bool ValidOuterExtent(uint flags, long storedSize, long logicalSize, int firstBlock, int imageLength, int blockSize) =>
+        (flags & 1) != 0 && storedSize > 0 && logicalSize > 0 && logicalSize < int.MaxValue &&
+        firstBlock > 0 && (long)firstBlock * blockSize + storedSize <= imageLength;
+
+    private static void DecryptOuter(byte[] image, byte[] dataKey, byte[] tweakKey, int blockSize, int sectorSize, ulong sectorBase)
+    {
+        for (var sectorNo = blockSize / sectorSize; sectorNo * sectorSize < image.Length; sectorNo++)
+        {
+            var blockNo = sectorNo / (blockSize / sectorSize);
+            if (blockNo == 4) continue;
+            AesXtsDecryptSectorInPlace(image.AsSpan(sectorNo * sectorSize, sectorSize), dataKey, tweakKey, sectorBase + (ulong)sectorNo);
+        }
+    }
 
     private static byte[] UnwrapPfsc(byte[] pfsc, long logicalSize)
     {
