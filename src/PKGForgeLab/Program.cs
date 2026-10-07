@@ -384,7 +384,6 @@ public static class PkgInspector
     private static InnerNode[] ParseInnerPfsFiles(byte[] pfs)
     {
         const int blockSize = 0x10000;
-        const int inodeSize = 0xA8;
         if (pfs.Length < blockSize || LE64S(pfs, 8) != 20130315)
             throw new InvalidDataException("Inner PFS header magic mismatch.");
         var inodeCount = checked((int)LE64S(pfs, 0x30));
@@ -635,7 +634,7 @@ public static class PkgComparer
         sb.AppendLine($"status: good={good.InnerPfs?.Status ?? "missing"} | bad={bad.InnerPfs?.Status ?? "missing"}");
         if (good.InnerPfs is not null && bad.InnerPfs is not null)
         {
-            Add(sb, "logical size", good.InnerPfs.LogicalSize, bad.InnerPfs.LogicalSize);
+            sb.AppendLine($"{"logical size",-24} GOOD={good.InnerPfs.LogicalSize?.ToString() ?? "null",-16} BAD={bad.InnerPfs.LogicalSize?.ToString() ?? "null",-16} {(good.InnerPfs.LogicalSize==bad.InnerPfs.LogicalSize?"MATCH":"DIFF")}");
             var paths = good.InnerPfs.Files.Select(x=>x.Path).Union(bad.InnerPfs.Files.Select(x=>x.Path)).Order(StringComparer.Ordinal);
             foreach (var path in paths)
             {
