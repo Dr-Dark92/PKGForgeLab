@@ -843,6 +843,9 @@ public static class PkgComparer
                 sb.AppendLine($"0x{id:X8}: good={FormatEntry(g)} | bad={FormatEntry(b)}");
         }
 
+        sb.AppendLine();
+        sb.AppendLine(EntryIntegrityAudit.Compare(good.Path,bad.Path));
+
         return sb.ToString();
     }
 
