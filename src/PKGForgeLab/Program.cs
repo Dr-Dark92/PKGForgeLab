@@ -243,7 +243,7 @@ public static class PkgInspector
         {
             var contentId = paramSfo.FirstOrDefault(x => x.Key == "CONTENT_ID")?.Value;
             if (outer is not null && !string.IsNullOrWhiteSpace(contentId))
-                inner = InspectInnerPfs(fs, outer, contentId);
+                inner = InspectInnerPfs(fs, outer, contentId, entries);
         }
         catch (Exception ex)
         {
@@ -275,10 +275,12 @@ public static class PkgInspector
             inner);
     }
 
-    private static InnerPfsReport InspectInnerPfs(FileStream pkg, OuterPfsReport outer, string contentId)
+    private static InnerPfsReport InspectInnerPfs(FileStream pkg, OuterPfsReport outer, string contentId, IReadOnlyList<PkgEntryReport> entries)
     {
         const string passcode = "00000000000000000000000000000000";
         const int blockSize = 0x10000;
+
+        var keyFingerprint = DiagnoseEntryKeys(pkg, entries, contentId, passcode);
         const int sectorSize = 0x1000;
 
         if (outer.BlockSize != blockSize)
@@ -332,7 +334,7 @@ public static class PkgInspector
                 }
             }
             if (!ValidOuterExtent(flags, storedSize, logicalSize, firstBlock, image.Length, blockSize))
-                return new InnerPfsReport("OUTER_DECRYPT_FAILED: no valid pfs_image inode; " + string.Join(" | ", candidates), logicalSize, [], []);
+                return new InnerPfsReport("OUTER_DECRYPT_FAILED: no valid pfs_image inode; " + keyFingerprint + " | " + string.Join(" | ", candidates), logicalSize, [], []);
         }
         if ((flags & 1) == 0)
             return new InnerPfsReport("OUTER_DECRYPT_FAILED: pfs_image.dat is not marked compressed/PFSC", logicalSize, [], []);
@@ -359,6 +361,50 @@ public static class PkgInspector
     }
 
     private sealed record InnerNode(string Path, long Size, int StartBlock);
+
+    private static string DiagnoseEntryKeys(FileStream pkg, IReadOnlyList<PkgEntryReport> entries, string contentId, string passcode)
+    {
+        var e = entries.FirstOrDefault(x => x.Id == 0x10);
+        if (e is null) return "entrykeys=missing";
+        try
+        {
+            var raw = ReadExact(pkg, e.DataOffset, checked((int)e.DataSize));
+            var dec = DecryptPkgEntry(raw, e, contentId, passcode);
+            if (dec.Length < 0x100) return "entrykeys=short";
+            var padded = new byte[48];
+            System.Text.Encoding.ASCII.GetBytes(contentId).CopyTo(padded,0);
+            var expectedCid = SHA256.HashData(padded);
+            var cidMatch = dec.AsSpan(0,32).SequenceEqual(expectedCid);
+            var matches = new List<int>();
+            for (uint i=0;i<7;i++)
+            {
+                var key = ComputeKey(contentId, passcode, i);
+                var digest = SHA256.HashData(key);
+                for(var j=0;j<32;j++) digest[j]^=key[j];
+                if(dec.AsSpan(32+(int)i*32,32).SequenceEqual(digest)) matches.Add((int)i);
+            }
+            return $"entrykeys:cid={cidMatch},digests=[{string.Join(",",matches)}],sha256={Convert.ToHexString(SHA256.HashData(dec))}";
+        }
+        catch(Exception ex) { return "entrykeys:error=" + ex.Message; }
+    }
+
+    private static byte[] DecryptPkgEntry(byte[] data, PkgEntryReport e, string contentId, string passcode)
+    {
+        var meta=new byte[32];
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(0,4),e.Id);
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(4,4),e.NameOffset);
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(8,4),e.Flags1);
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(12,4),e.Flags2);
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(16,4),checked((uint)e.DataOffset));
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(20,4),checked((uint)e.DataSize));
+        var keyIndex=(e.Flags2&0xF000u)>>12;
+        var keySeed=ComputeKey(contentId,passcode,keyIndex);
+        var ivSource=new byte[64]; meta.CopyTo(ivSource,0); keySeed.CopyTo(ivSource,32);
+        var ivKey=SHA256.HashData(ivSource);
+        using var aes=Aes.Create(); aes.Key=ivKey[16..32]; aes.IV=ivKey[..16]; aes.Mode=CipherMode.CBC; aes.Padding=PaddingMode.None;
+        using var dec=aes.CreateDecryptor();
+        return dec.TransformFinalBlock(data,0,data.Length);
+    }
 
     private static bool ValidOuterExtent(uint flags, long storedSize, long logicalSize, int firstBlock, int imageLength, int blockSize) =>
         (flags & 1) != 0 && storedSize > 0 && logicalSize > 0 && logicalSize < int.MaxValue &&
