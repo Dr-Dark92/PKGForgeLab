@@ -33,6 +33,11 @@ try
         Console.WriteLine($"Wrote: {diffPath}");
         Console.WriteLine();
         Console.WriteLine(diff);
+        var digestDiff = GeneralDigestAudit.Compare(reports[0].Path, reports[1].Path);
+        var digestPath = Path.Combine(dir, name + ".pkglab.digests.txt");
+        File.WriteAllText(digestPath, digestDiff);
+        Console.WriteLine($"Wrote: {digestPath}");
+        Console.WriteLine(digestDiff);
     }
 
     return 0;
