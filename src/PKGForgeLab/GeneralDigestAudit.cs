@@ -13,8 +13,15 @@ public static class GeneralDigestAudit
         var sb = new StringBuilder();
         sb.AppendLine("[GENERAL_DIGESTS offline comparison]");
         sb.AppendLine("Slot values and flag bits are observations, not verified semantic mappings.");
+        sb.AppendLine($"REFERENCE: {a.Diagnostic}");
+        sb.AppendLine($"CANDIDATE: {b.Diagnostic}");
+        if (a.Slots is null || b.Slots is null)
+        {
+            sb.AppendLine("Slot comparison unavailable: at least one entry did not decrypt to D256.");
+            return sb.ToString();
+        }
         sb.AppendLine($"REFERENCE flags={a.Flags} CANDIDATE flags={b.Flags}");
-        for (var i = 0; i < 7; i++)
+        for (var i = 0; i < 7; i)
         {
             var offset = 0x20 + 32 * i;
             sb.AppendLine($"slot[{i}] offset=0x{offset:X3} ref={a.Slots[i]} candidate={b.Slots[i]} match={a.Slots[i] == b.Slots[i]}");
@@ -22,7 +29,7 @@ public static class GeneralDigestAudit
         return sb.ToString();
     }
 
-    private sealed record Audit(string Flags, string[] Slots);
+    private sealed record Audit(string Flags, string[]? Slots, string Diagnostic);
 
     private static Audit Inspect(string path)
     {
@@ -51,13 +58,24 @@ public static class GeneralDigestAudit
             fs.Position = off;
             fs.ReadExactly(ciphertext);
             var pkgEntry = report.Entries.Single(x => x.Id == 0x0400);
-            var data = PkgInspector.DecryptFakePkgEntry(ciphertext, pkgEntry, contentId);
-            if (BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(0, 2)) != 0xD256)
-                throw new InvalidDataException("GENERAL_DIGESTS decryption failed: unexpected magic.");
-            var slots = Enumerable.Range(0, 7)
-                .Select(j => Convert.ToHexString(data.AsSpan(0x20 + j * 32, 32)))
-                .ToArray();
-            return new Audit($"0x{BE32(data, 0x1C):X8}", slots);
+            var cipherHash = Convert.ToHexString(SHA256.HashData(ciphertext));
+            var cipherPrefix = Convert.ToHexString(ciphertext.AsSpan(0, 16));
+            try
+            {
+                var data = PkgInspector.DecryptFakePkgEntry(ciphertext, pkgEntry, contentId);
+                var plainPrefix = Convert.ToHexString(data.AsSpan(0, Math.Min(16, data.Length)));
+                var diagnostic = $"entry=0x0400 offset=0x{off:X} size=0x{len:X} flags2=0x{pkgEntry.Flags2:X8} cipherSha256={cipherHash} cipherPrefix={cipherPrefix} derivedKeyAttemptPrefix={plainPrefix}";
+                if (data.Length < 0x100 || BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(0, 2)) != 0xD256)
+                    return new Audit("UNAVAILABLE", null, diagnostic + " status=DECRYPTION_UNVERIFIED (expected D256)");
+                var slots = Enumerable.Range(0, 7)
+                    .Select(j => Convert.ToHexString(data.AsSpan(0x20 + j * 32, 32)))
+                    .ToArray();
+                return new Audit($"0x{BE32(data, 0x1C):X8}", slots, diagnostic + " status=DECRYPTED");
+            }
+            catch (Exception ex)
+            {
+                return new Audit("UNAVAILABLE", null, $"entry=0x0400 offset=0x{off:X} size=0x{len:X} cipherSha256={cipherHash} cipherPrefix={cipherPrefix} status=DECRYPTION_ERROR {ex.GetType().Name}: {ex.Message}");
+            }
         }
         throw new InvalidDataException("GENERAL_DIGESTS (0x0400) entry missing.");
     }
