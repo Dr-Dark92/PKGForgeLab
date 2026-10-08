@@ -26,6 +26,9 @@ public static class GeneralDigestAudit
 
     private static Audit Inspect(string path)
     {
+        var report = PkgInspector.Inspect(path);
+        var contentId = report.ParamSfo.FirstOrDefault(x => x.Key == "CONTENT_ID")?.Value
+            ?? throw new InvalidDataException("CONTENT_ID is missing.");
         using var fs = File.OpenRead(path);
         var header = new byte[0x1000];
         fs.ReadExactly(header);
@@ -44,9 +47,13 @@ public static class GeneralDigestAudit
             var len = BE32(entry, 20);
             if (len < 0x100 || (ulong)off + len > (ulong)fs.Length)
                 throw new InvalidDataException("GENERAL_DIGESTS entry is truncated.");
-            var data = new byte[0x100];
+            var ciphertext = new byte[checked((int)len)];
             fs.Position = off;
-            fs.ReadExactly(data);
+            fs.ReadExactly(ciphertext);
+            var pkgEntry = report.Entries.Single(x => x.Id == 0x0400);
+            var data = PkgInspector.DecryptFakePkgEntry(ciphertext, pkgEntry, contentId);
+            if (BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(0, 2)) != 0xD256)
+                throw new InvalidDataException("GENERAL_DIGESTS decryption failed: unexpected magic.");
             var slots = Enumerable.Range(0, 7)
                 .Select(j => Convert.ToHexString(data.AsSpan(0x20 + j * 32, 32)))
                 .ToArray();
