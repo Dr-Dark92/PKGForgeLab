@@ -33,8 +33,17 @@ try
         Console.WriteLine($"Wrote: {diffPath}");
         Console.WriteLine();
         Console.WriteLine(diff);
-        var digestDiff = GeneralDigestAudit.Compare(reports[0].Path, reports[1].Path);
         var digestPath = Path.Combine(dir, name + ".pkglab.digests.txt");
+        string digestDiff;
+        try
+        {
+            digestDiff = GeneralDigestAudit.Compare(reports[0].Path, reports[1].Path);
+        }
+        catch (Exception digestError)
+        {
+            digestDiff = "[GENERAL_DIGESTS offline comparison] FAILED" + Environment.NewLine
+                + digestError.ToString() + Environment.NewLine;
+        }
         File.WriteAllText(digestPath, digestDiff);
         Console.WriteLine($"Wrote: {digestPath}");
         Console.WriteLine(digestDiff);
