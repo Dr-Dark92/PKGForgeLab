@@ -460,6 +460,9 @@ public static class PkgInspector
         catch(Exception ex) { return "entrykeys:error=" + ex.Message; }
     }
 
+    public static byte[] DecryptFakePkgEntry(byte[] data, PkgEntryReport entry, string contentId)
+        => DecryptPkgEntry(data, entry, contentId, "00000000000000000000000000000000");
+
     private static byte[] DecryptPkgEntry(byte[] data, PkgEntryReport e, string contentId, string passcode)
     {
         var meta=new byte[32];
